@@ -1,99 +1,144 @@
-# ------------------------------
-# 1️⃣ Install required library
-# ------------------------------
-!pip install noisereduce
-
-# ------------------------------
-# 2️⃣ Import libraries
-# ------------------------------
+import sounddevice as sd
+import scipy.io.wavfile as wav
 import librosa
 import numpy as np
-import noisereduce as nr
 import os
+import noisereduce as nr
 
-# ------------------------------
-# 3️⃣ Audio processing functions
-# ------------------------------
+# ==============================
+# CONFIG
+# ==============================
+SAMPLE_RATE = 16000
+DURATION = 3  # seconds
+
+COMMAND_DIR = "commands"
+OWNER_DIR = "owner"
+
+os.makedirs(COMMAND_DIR, exist_ok=True)
+os.makedirs(OWNER_DIR, exist_ok=True)
+
+# ==============================
+# RECORD AUDIO
+# ==============================
+def record_voice(filename):
+    print("Recording...")
+    audio = sd.rec(
+        int(DURATION * SAMPLE_RATE),
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32"
+    )
+    sd.wait()
+    wav.write(filename, SAMPLE_RATE, audio)
+    print(f"Saved: {filename}")
+
+# ==============================
+# PREPROCESS AUDIO
+# ==============================
 def preprocess_audio(file):
-    y, sr = librosa.load(file, sr=16000)
+    y, sr = librosa.load(file, sr=SAMPLE_RATE)
 
-    # Remove silence
+    # Trim silence
     y, _ = librosa.effects.trim(y, top_db=20)
-
-    # Normalize volume
-    y = librosa.util.normalize(y)
 
     # Noise reduction
     y = nr.reduce_noise(y=y, sr=sr)
 
+    # Normalize volume
+    y = librosa.util.normalize(y)
+
     return y, sr
 
+# ==============================
+# FEATURE EXTRACTION
+# ==============================
 def extract_features(file):
     y, sr = preprocess_audio(file)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     return np.mean(mfcc.T, axis=0)
 
+# ==============================
+# SIMILARITY METRIC
+# ==============================
 def similarity(f1, f2):
     return np.linalg.norm(f1 - f2)
 
-# ------------------------------
-# 4️⃣ Command detection
-# ------------------------------
+# ==============================
+# COMMAND DETECTION
+# ==============================
 def detect_command(input_file):
     input_feat = extract_features(input_file)
+
     best_match = None
-    lowest_dist = float("inf")
+    best_distance = float("inf")
 
-    commands = [
-        "Wav Files/hum_open.wav",
-        "Wav Files/hum_close.wav"
-    ]
+    for file in os.listdir(COMMAND_DIR):
+        path = os.path.join(COMMAND_DIR, file)
+        feat = extract_features(path)
+        dist = similarity(input_feat, feat)
 
-    for file in commands:
-        command_feat = extract_features(file)
-        dist = similarity(input_feat, command_feat)
-        if dist < lowest_dist:
-            lowest_dist = dist
-            best_match = os.path.basename(file).replace("hum_", "").replace(".wav", "")
+        if dist < best_distance:
+            best_distance = dist
+            best_match = file.replace(".wav", "").upper()
 
-    print(f"\nDetected Command: {best_match.upper()}  (distance={lowest_dist:.2f})")
-    return best_match
+    print(f"Detected Command: {best_match}  (distance={best_distance:.2f})")
+    return best_match, best_distance
 
-# ------------------------------
-# 5️⃣ Speaker verification
-# ------------------------------
-def verify_speaker(input_file, threshold=100):
+# ==============================
+# SPEAKER VERIFICATION
+# ==============================
+def verify_speaker(input_file, threshold=80):
     input_feat = extract_features(input_file)
 
-    owners = [
-        "Wav Files/hum_auth.wav",
-        "Wav Files/owner_owner2.wav"
-    ]
+    for file in os.listdir(OWNER_DIR):
+        path = os.path.join(OWNER_DIR, file)
+        feat = extract_features(path)
+        dist = similarity(input_feat, feat)
 
-    for file in owners:
-        owner_feat = extract_features(file)
-        dist = similarity(input_feat, owner_feat)
-        print(f"Distance to {os.path.basename(file)}: {dist:.2f}")
+        print(f"Distance to {file}: {dist:.2f}")
+
         if dist < threshold:
-            print("\nSpeaker Verified ✅")
+            print("Speaker Verified ✅")
             return True
 
-    print("\nSpeaker Rejected ❌")
+    print("Speaker Rejected ❌")
     return False
 
-# ------------------------------
-# 6️⃣ Main execution
-# ------------------------------
-print("Running Voice Command + Voice Authentication System...")
+# ==============================
+# MAIN MENU
+# ==============================
+def main():
+    print("\nVoice Command + Voice Authentication System")
+    print("1 - Record Command Samples")
+    print("2 - Record Owner Voice Samples")
+    print("3 - Live Test System")
 
-test_file = "Wav Files/test.wav"  # Your uploaded test file
+    choice = input("Select option: ")
 
-command = detect_command(test_file)
-authorized = verify_speaker(test_file)
+    if choice == "1":
+        name = input("Command name (open / close): ").lower()
+        record_voice(os.path.join(COMMAND_DIR, f"{name}.wav"))
 
-print("\n==============================")
-if authorized:
-    print(f"ACCESS GRANTED → EXECUTING COMMAND: {command.upper()}")
-else:
-    print("ACCESS DENIED!")
-print("==============================")
+    elif choice == "2":
+        name = input("Owner sample name (owner1 / owner2): ").lower()
+        record_voice(os.path.join(OWNER_DIR, f"{name}.wav"))
+
+    elif choice == "3":
+        print("\nSpeak a command clearly (OPEN or CLOSE)")
+        record_voice("test.wav")
+
+        command, _ = detect_command("test.wav")
+        authorized = verify_speaker("test.wav")
+
+        print("\n==============================")
+        if authorized:
+            print(f"ACCESS GRANTED → EXECUTING COMMAND: {command}")
+        else:
+            print("ACCESS DENIED!")
+        print("==============================")
+
+    else:
+        print("Invalid option.")
+
+if __name__ == "__main__":
+    main()
