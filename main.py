@@ -10,7 +10,9 @@ import time
 # ==============================
 SAMPLE_RATE = 16000
 RECORD_SECONDS = 3
-FIXED_LEN = SAMPLE_RATE * 1  # 1 second
+FRAME_LEN = 0.03  # 30 ms
+FRAME_STEP = 0.01 # 10 ms
+PASSPHRASES = {"open", "close"}
 
 COMMAND_DIR = "commands"
 OWNER_DIR = "owner"
@@ -23,20 +25,11 @@ os.makedirs(OWNER_DIR, exist_ok=True)
 # ==============================
 def record_voice(filename):
     print("Recording...")
-    audio = sd.rec(
-        int(RECORD_SECONDS * SAMPLE_RATE),
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32"
-    )
+    audio = sd.rec(int(RECORD_SECONDS*SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype="float32")
     sd.wait()
-
     audio = audio.flatten()
-    peak = np.max(np.abs(audio))
-    if peak > 0:
-        audio = audio / peak * 0.9
-
-    wav.write(filename, SAMPLE_RATE, np.int16(audio * 32767))
+    audio = audio / (np.max(np.abs(audio)) + 1e-9)
+    wav.write(filename, SAMPLE_RATE, np.int16(audio*32767))
     print(f"Saved: {filename}")
 
 # ==============================
@@ -44,192 +37,135 @@ def record_voice(filename):
 # ==============================
 def preprocess_audio(file):
     y, sr = librosa.load(file, sr=SAMPLE_RATE, mono=True)
-
-    y, _ = librosa.effects.trim(y, top_db=35)
-    y = librosa.util.fix_length(y, size=FIXED_LEN)
-
-    rms = np.sqrt(np.mean(y ** 2))
-    if rms > 0:
-        y = y / rms
-
+    y, _ = librosa.effects.trim(y, top_db=20)
     return y, sr
 
 # ==============================
-# FEATURE EXTRACTION
+# FRAME-LEVEL FEATURE EXTRACTION
 # ==============================
-def extract_features(file):
-    y, sr = preprocess_audio(file)
+def frame_features(y, sr):
+    frame_size = int(FRAME_LEN*sr)
+    step_size = int(FRAME_STEP*sr)
+    frames = []
 
-    mfcc = librosa.feature.mfcc(
-        y=y,
-        sr=sr,
-        n_mfcc=20,
-        n_fft=512,
-        hop_length=160
-    )
-
-    delta = librosa.feature.delta(mfcc)
-    delta2 = librosa.feature.delta(mfcc, order=2)
-
-    feat = np.concatenate([
-        np.mean(mfcc, axis=1),
-        np.std(mfcc, axis=1),
-        np.mean(delta, axis=1),
-        np.std(delta, axis=1),
-        np.mean(delta2, axis=1),
-        np.std(delta2, axis=1)
-    ])
-
-    return feat / (np.linalg.norm(feat) + 1e-8)
+    for start in range(0, len(y)-frame_size, step_size):
+        frame = y[start:start+frame_size]
+        # LPC
+        lpc_order = 8
+        try:
+            lpc_coeffs = librosa.lpc(frame, order=lpc_order)
+        except np.linalg.LinAlgError:
+            lpc_coeffs = np.zeros(lpc_order+1)
+        # Pitch
+        f0 = librosa.yin(frame, fmin=80, fmax=400)
+        f0 = np.nan_to_num(f0)
+        pitch_mean = np.mean(f0)
+        # Energy
+        energy = np.sum(frame**2)
+        feat = np.concatenate([lpc_coeffs[1:], [pitch_mean], [energy]])
+        frames.append(feat)
+    return np.array(frames)
 
 # ==============================
-# COSINE DISTANCE
+# CORRELATION BETWEEN FRAMES
 # ==============================
-def cosine_distance(f1, f2):
-    return 1.0 - np.dot(f1, f2)
-
-# ==============================
-# DISTANCE → SIMILARITY
-# ==============================
-def distance_to_similarity(d):
-    return 100 / (1 + np.exp(10 * (d - 0.3)))
-
-# ==============================
-# BUILD COMMAND MODELS
-# ==============================
-def build_command_models():
-    models = {}
-
-    for file in os.listdir(COMMAND_DIR):
-        cmd = file.split("_")[0]
-        path = os.path.join(COMMAND_DIR, file)
-        feat = extract_features(path)
-        models.setdefault(cmd, []).append(feat)
-
-    for cmd in models:
-        models[cmd] = np.mean(models[cmd], axis=0)
-
-    return models
+def frame_correlation(frames1, frames2):
+    min_len = min(len(frames1), len(frames2))
+    corr_vals = []
+    for i in range(min_len):
+        f1 = frames1[i]
+        f2 = frames2[i]
+        # normalized correlation
+        if np.linalg.norm(f1)==0 or np.linalg.norm(f2)==0:
+            corr = 0
+        else:
+            corr = np.dot(f1,f2)/(np.linalg.norm(f1)*np.linalg.norm(f2))
+        corr_vals.append(corr)
+    return np.mean(corr_vals)
 
 # ==============================
 # COMMAND DETECTION
 # ==============================
-def detect_command(input_file, models, threshold=0.45):
-    input_feat = extract_features(input_file)
+def detect_command(file, threshold=0.25):
+    y, sr = preprocess_audio(file)
+    test_frames = frame_features(y, sr)
 
     best_cmd = None
-    best_dist = float("inf")
-
-    for cmd, centroid in models.items():
-        dist = cosine_distance(input_feat, centroid)
-        if dist < best_dist:
-            best_dist = dist
-            best_cmd = cmd.upper()
-
-    sim = distance_to_similarity(best_dist)
-    print(f"Command={best_cmd} | similarity={sim:.1f}% | distance={best_dist:.3f}")
-
-    if best_dist > threshold:
+    best_corr = -1
+    for cmd_file in os.listdir(COMMAND_DIR):
+        path = os.path.join(COMMAND_DIR, cmd_file)
+        y_c, sr_c = preprocess_audio(path)
+        cmd_frames = frame_features(y_c, sr_c)
+        corr = frame_correlation(test_frames, cmd_frames)
+        if corr > best_corr:
+            best_corr = corr
+            best_cmd = cmd_file.split("_")[0]
+    print(f"Command detected: {best_cmd} | correlation={best_corr:.3f}")
+    if best_corr < threshold:
         return None
-
     return best_cmd
-
-# ==============================
-# BUILD OWNER MODEL
-# ==============================
-def build_owner_model():
-    feats = []
-
-    for file in os.listdir(OWNER_DIR):
-        path = os.path.join(OWNER_DIR, file)
-        feats.append(extract_features(path))
-
-    if len(feats) == 0:
-        raise RuntimeError("No owner samples found")
-
-    centroid = np.mean(feats, axis=0)
-    return centroid, feats
 
 # ==============================
 # SPEAKER VERIFICATION
 # ==============================
-def verify_speaker(input_file, owner_centroid, owner_feats, margin=0.08):
-    input_feat = extract_features(input_file)
+def verify_speaker(file, command, threshold=0.4):
+    y, sr = preprocess_audio(file)
+    test_frames = frame_features(y, sr)
 
-    d_owner = cosine_distance(input_feat, owner_centroid)
-    intra = [cosine_distance(owner_centroid, f) for f in owner_feats]
-
-    threshold = np.mean(intra) + margin
-
-    sim = distance_to_similarity(d_owner)
-    req_sim = distance_to_similarity(threshold)
-
-    print(
-        f"Speaker similarity={sim:.1f}% | required ≥ {req_sim:.1f}% "
-        f"(distance={d_owner:.3f})"
-    )
-
-    return d_owner < threshold
+    best_corr = -1
+    for owner_file in os.listdir(OWNER_DIR):
+        if not owner_file.startswith(command): 
+            continue
+        y_o, sr_o = preprocess_audio(os.path.join(OWNER_DIR, owner_file))
+        owner_frames = frame_features(y_o, sr_o)
+        corr = frame_correlation(test_frames, owner_frames)
+        print(f"Correlation with {owner_file}: {corr:.3f}")
+        if corr > best_corr:
+            best_corr = corr
+    print(f"Best correlation: {best_corr:.3f}")
+    return best_corr >= threshold
 
 # ==============================
 # MAIN LOOP
 # ==============================
 def main():
     while True:
-        print("\nVoice Command + Speaker Verification")
-        print("1 - Record Command Samples")
-        print("2 - Record Owner Samples")
-        print("3 - Test System")
+        print("\nVOICE COMMAND + SPEAKER RECOGNITION (Frame Correlation S&S)")
+        print("1 - Record command samples")
+        print("2 - Record owner samples")
+        print("3 - Test system")
         print("q - Quit")
-
         choice = input("Choice: ").lower()
 
-        if choice == "1":
+        if choice=="1":
             while True:
-                name = input("Command name (or b): ").lower()
-                if name == "b":
-                    break
-                filename = os.path.join(
-                    COMMAND_DIR, f"{name}_{int(time.time())}.wav"
-                )
-                record_voice(filename)
+                name = input("Command name (open/close or b): ").lower()
+                if name=="b": break
+                if name not in PASSPHRASES: 
+                    print("Only open or close allowed"); continue
+                record_voice(os.path.join(COMMAND_DIR,f"{name}_{int(time.time())}.wav"))
 
-        elif choice == "2":
+        elif choice=="2":
             while True:
-                name = input("Owner sample name (or b): ").lower()
-                if name == "b":
-                    break
-                filename = os.path.join(
-                    OWNER_DIR, f"{name}_{int(time.time())}.wav"
-                )
-                record_voice(filename)
+                name = input("Owner sample name (open/close or b): ").lower()
+                if name=="b": break
+                if name not in PASSPHRASES: 
+                    print("Only open or close allowed"); continue
+                record_voice(os.path.join(OWNER_DIR,f"{name}_{int(time.time())}.wav"))
 
-        elif choice == "3":
-            if not os.listdir(COMMAND_DIR) or not os.listdir(OWNER_DIR):
-                print("❌ Please record command and owner samples first.")
-                continue
-
-            cmd_models = build_command_models()
-            owner_centroid, owner_feats = build_owner_model()
-
-            print("Speak now...")
+        elif choice=="3":
             record_voice("test.wav")
-
-            cmd = detect_command("test.wav", cmd_models)
+            cmd = detect_command("test.wav")
             if cmd is None:
-                print("❌ Command rejected")
+                print("❌ INVALID COMMAND")
                 continue
-
-            if verify_speaker("test.wav", owner_centroid, owner_feats):
-                print(f"✅ ACCESS GRANTED → {cmd}")
+            if verify_speaker("test.wav", cmd):
+                print(f"✅ ACCESS GRANTED → {cmd.upper()}")
             else:
                 print("❌ SPEAKER REJECTED")
 
-        elif choice == "q":
+        elif choice=="q":
             break
 
-# ==============================
-# ENTRY POINT
-# ==============================
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
